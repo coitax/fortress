@@ -1,11 +1,12 @@
 # syntax=docker/dockerfile:1
 # Fortress — stealth Chromium as a CDP endpoint. Works on any OS that runs Docker.
 #
-# Build (from a dir containing the extracted tilion-fortress/ bundle + packaging/docker-entrypoint.sh):
+# Build (from a dir containing the extracted tilion-fortress/ bundle + packaging/docker-entrypoint.sh
+# and packaging/devtools-gate.sh):
 #   DOCKER_BUILDKIT=1 docker build -f packaging/Dockerfile -t tilion/fortress:latest .
-# Run:
-#   docker run --rm -p 9222:9222 tilion/fortress:latest
-#   -> connect_over_cdp("http://localhost:9222")
+# Run (DevTools requires the TILION_CDP_TOKEN debug token; one is generated and logged if unset):
+#   docker run --rm -p 127.0.0.1:9222:9222 -e TILION_CDP_TOKEN tilion/fortress:latest
+#   -> connect_over_cdp("http://localhost:9222", headers={"Authorization": "Bearer <token>"})
 #
 # Size-optimized: ELF strip + locale trim in a throwaway prep stage (the toolchain never
 # ships), and COPY --chown at copy time so the bundle is stored ONCE. (A `chown -R` RUN
@@ -38,6 +39,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 RUN useradd -m -u 1000 tilion
 COPY --from=prep --chown=tilion:tilion /opt/tilion/ /opt/tilion/
 COPY --chmod=0755 packaging/docker-entrypoint.sh /usr/local/bin/docker-entrypoint.sh
+COPY --chmod=0755 packaging/devtools-gate.sh /usr/local/bin/devtools-gate.sh
 USER tilion
 ENV HOME=/home/tilion
 EXPOSE 9222

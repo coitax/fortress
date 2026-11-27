@@ -20,8 +20,8 @@ body:
     attributes:
       label: Steps to reproduce
       placeholder: |
-        1. docker run -p 9222:9222 tilion/fortress:latest
-        2. connect_over_cdp("http://localhost:9222")
+        1. docker run -p 127.0.0.1:9222:9222 -e TILION_CDP_TOKEN tilion/fortress:latest
+        2. connect_over_cdp("http://localhost:9222", headers={"Authorization": "Bearer <token>"})
         3. ...
     validations:
       required: true

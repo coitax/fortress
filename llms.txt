@@ -7,7 +7,7 @@ Rules for agents:
 - Fortress hardens the browser fingerprint only. IP reputation and behavior are still the caller's responsibility.
 
 ## Launch (pick one; all expose CDP on http://localhost:9222)
-- Docker: `docker run -d --rm -p 9222:9222 tilion/fortress:latest`
+- Docker: `docker run -d --rm -p 127.0.0.1:9222:9222 -e TILION_CDP_TOKEN tilion/fortress:latest` (DevTools requires `Authorization: Bearer $TILION_CDP_TOKEN`; if unset, a token is generated and printed to `docker logs`)
 - Python: `pip install tilion-fortress` then `from tilion_fortress import Fortress; f=Fortress(); f.start()`
 - Node: `npm install tilion-fortress` then `import {Fortress} from "tilion-fortress"; const f=await Fortress.launch()`
 

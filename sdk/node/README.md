@@ -33,7 +33,7 @@ import { Fortress } from "tilion-fortress";
 import puppeteer from "puppeteer-core";
 
 const f = await Fortress.launch();                       // stealth engine on a CDP endpoint
-const browser = await puppeteer.connect({ browserURL: f.cdpUrl });
+const browser = await puppeteer.connect({ browserWSEndpoint: f.cdpUrl });
 const page = await browser.newPage();
 await page.goto("https://bot.sannysoft.com");
 await page.screenshot({ path: "all-green.png" });

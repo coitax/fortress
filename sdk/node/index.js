@@ -7,7 +7,7 @@ import { createWriteStream, existsSync, chmodSync, mkdirSync, createReadStream }
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { pipeline } from "node:stream/promises";
-import { createHash } from "node:crypto";
+import { createHash, randomBytes } from "node:crypto";
 
 export const VERSION = "151.0.7908.0";
 const REPO = "tiliondev/fortress";
@@ -104,11 +104,17 @@ async function assetExists(plat, host) {
   catch { return false; }
 }
 
-async function waitCdp(port, timeoutMs = 90000) {
+async function waitCdp(port, token, timeoutMs = 90000) {
   const deadline = Date.now() + timeoutMs;
+  const headers = token ? { Authorization: `Bearer ${token}` } : {};
   while (Date.now() < deadline) {
-    try { const r = await fetch(`http://127.0.0.1:${port}/json/version`); if (r.ok) return (await r.json()).webSocketDebuggerUrl; }
-    catch {}
+    try {
+      const r = await fetch(`http://127.0.0.1:${port}/json/version`, { headers });
+      if (r.ok) {
+        const ws = (await r.json()).webSocketDebuggerUrl;
+        return token ? `${ws}?token=${token}` : ws;
+      }
+    } catch {}
     await new Promise((r) => setTimeout(r, 500));
   }
   throw new Error("Fortress CDP endpoint did not come up");
@@ -119,7 +125,10 @@ export class Fortress {
     if (!CHANNELS[channel]) throw new Error(`unknown channel '${channel}'; use one of ${Object.keys(CHANNELS)}`);
     const { tag, docker } = CHANNELS[channel];
     Object.assign(this, { port, persona, extraArgs, headless, channel, tag, docker, host: hostFor(tag),
-                          proc: null, dockerName: null, cdpUrl: null });
+                          proc: null, dockerName: null, cdpUrl: null, token: null,
+                          // Headers a CDP client must send to the http:// endpoint (Docker only;
+                          // cdpUrl already carries the token).
+                          cdpHeaders: {} });
   }
   static async launch(opts) { return new Fortress(opts).start(); }
 
@@ -127,7 +136,7 @@ export class Fortress {
     const plat = resolvePlatform();
     const native = plat && (plat === "linux-x64" || await assetExists(plat, this.host));
     if (native) await this._startNative(plat); else this._startDocker();
-    this.cdpUrl = await waitCdp(this.port);
+    this.cdpUrl = await waitCdp(this.port, this.token);
     return this;
   }
 
@@ -144,9 +153,14 @@ export class Fortress {
     if (spawnSync("docker", ["--version"]).status !== 0)
       throw new Error("No native binary for this platform yet and Docker not installed. Install Docker Desktop or use Linux x64.");
     this.dockerName = `tilion-fortress-${process.pid}-${this.port}`;
-    const args = ["run", "-d", "--rm", "--name", this.dockerName, "-p", `${this.port}:9222`, this.docker,
-      ...personaArgs(this.persona), ...this.extraArgs];
-    if (spawnSync("docker", args, { stdio: "ignore" }).status !== 0) throw new Error("docker run failed");
+    // The container's DevTools bridge requires this token. `-e NAME` makes docker
+    // read the value from its own environment, so it is not on the command line.
+    this.token = randomBytes(32).toString("hex");
+    this.cdpHeaders = { Authorization: `Bearer ${this.token}` };
+    const args = ["run", "-d", "--rm", "--name", this.dockerName, "-e", "TILION_CDP_TOKEN",
+      "-p", `127.0.0.1:${this.port}:9222`, this.docker, ...personaArgs(this.persona), ...this.extraArgs];
+    const env = { ...process.env, TILION_CDP_TOKEN: this.token };
+    if (spawnSync("docker", args, { stdio: "ignore", env }).status !== 0) throw new Error("docker run failed");
   }
 
   async close() {
