@@ -5,7 +5,7 @@
 import { spawn, spawnSync } from "node:child_process";
 import { createWriteStream, existsSync, chmodSync, mkdirSync, createReadStream } from "node:fs";
 import { homedir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { pipeline } from "node:stream/promises";
 import { createHash } from "node:crypto";
 
@@ -45,6 +45,35 @@ export function personaArgs(persona) {
     hwConcurrency: "--uxr-hw-concurrency", deviceMemory: "--uxr-device-memory",
     screenWidth: "--uxr-screen-width", screenHeight: "--uxr-screen-height", canvasSeed: "--uxr-canvas-seed" };
   return Object.entries(persona).map(([k, v]) => `${map[k] || `--uxr-${k}`}=${v}`);
+}
+
+// Mirrors packaging/tilion.cmd. On Windows the SDK starts chrome.exe directly instead of
+// that launcher: a .cmd file can only run under cmd.exe, which would parse persona values
+// and extraArgs as shell syntax. Keep the flags and their order in sync with tilion.cmd.
+export const WIN_DEFAULT_ARGS = [
+  "--uxr-platform=Win32", "--uxr-ua-platform=Windows", "--uxr-ua-os=Windows NT 10.0; Win64; x64",
+  "--uxr-ua-arch=x86", "--uxr-ua-bitness=64", "--uxr-ua-platform-version=15.0.0", "--uxr-ua-brand=Google Chrome",
+  "--uxr-hw-concurrency=16", "--uxr-device-memory=8",
+  "--uxr-webgl-vendor=Google Inc. (NVIDIA)",
+  "--uxr-webgl-renderer=ANGLE (NVIDIA, NVIDIA GeForce RTX 3060 Direct3D11 vs_5_0 ps_5_0, D3D11)",
+  "--uxr-webgl-fullparams=1", "--uxr-canvas-seed=778899", "--uxr-audio-seed=445566",
+  "--uxr-timezone=America/New_York", "--uxr-languages=en-US,en", "--accept-lang=en-US,en",
+  "--uxr-screen-width=1920", "--uxr-screen-height=1080",
+  "--uxr-webrtc-policy=disable_non_proxied_udp",
+  "--enable-unsafe-webgpu", "--enable-features=Vulkan", "--use-webgpu-adapter=swiftshader",
+  "--enable-dawn-features=use_vulkan", "--uxr-webgpu-vendor=nvidia", "--uxr-webgpu-architecture=ampere",
+  "--uxr-webgpu-description=NVIDIA GeForce RTX 3060",
+];
+
+export function windowsLaunch(launcherPath, args, env = process.env) {
+  const here = dirname(launcherPath);
+  const exe = join(here, "chrome.exe");
+  if (!existsSync(exe)) throw new Error(`chrome.exe missing from bundle: ${exe}`);
+  return {
+    command: exe,
+    args: ["--use-angle=swiftshader", ...(env.TILION_NO_DEFAULTS ? [] : WIN_DEFAULT_ARGS), ...args],
+    env: { ...env, VK_ICD_FILENAMES: join(here, "vk_swiftshader_icd.json") },
+  };
 }
 
 export async function sha256(path) {
@@ -90,9 +119,11 @@ async function ensureNative(plat, host, tag) {
     if (spawnSync("tar", ["xzf", archive, "-C", root], { stdio: "inherit" }).status !== 0)
       throw new Error("tar extraction failed");
   } else { // zip (Windows): use PowerShell Expand-Archive
-    if (spawnSync("powershell", ["-NoProfile", "-Command",
-        `Expand-Archive -Force -LiteralPath '${archive}' -DestinationPath '${root}'`],
-        { stdio: "inherit" }).status !== 0) throw new Error("zip extraction failed");
+    // Paths go through the environment so PowerShell never parses them as script text.
+    if (spawnSync("powershell", ["-NoProfile", "-NonInteractive", "-Command",
+        "Expand-Archive -Force -LiteralPath $env:TILION_ZIP -DestinationPath $env:TILION_DEST"],
+        { stdio: "inherit", env: { ...process.env, TILION_ZIP: archive, TILION_DEST: root } }).status !== 0)
+      throw new Error("zip extraction failed");
   }
   if (!launcher.endsWith(".cmd") && existsSync(launcherPath)) chmodSync(launcherPath, 0o755);
   if (!existsSync(launcherPath)) throw new Error(`launcher missing after extract: ${launcherPath}`);
@@ -137,7 +168,12 @@ export class Fortress {
     if (this.headless) args.push("--headless=new", "--no-sandbox");
     args.push(`--remote-debugging-port=${this.port}`, `--user-data-dir=${join(CACHE, "profile")}`,
               ...personaArgs(this.persona), ...this.extraArgs);
-    this.proc = spawn(launcher, args, { stdio: "ignore", shell: launcher.endsWith(".cmd") });
+    if (plat === "win-x64") {
+      const { command, args: argv, env } = windowsLaunch(launcher, args);
+      this.proc = spawn(command, argv, { stdio: "ignore", env });
+    } else {
+      this.proc = spawn(launcher, args, { stdio: "ignore" });
+    }
   }
 
   _startDocker() {
@@ -151,8 +187,8 @@ export class Fortress {
 
   async close() {
     if (this.proc) {
-      // On Windows the launcher runs under cmd.exe (shell:true); proc.kill() would
-      // only reap the shell and orphan chrome.exe, so kill the whole process tree.
+      // On Windows proc.kill() only ends the browser process and orphans its
+      // child processes, so kill the whole process tree.
       if (process.platform === "win32" && this.proc.pid)
         spawnSync("taskkill", ["/F", "/T", "/PID", String(this.proc.pid)], { stdio: "ignore" });
       else this.proc.kill();
