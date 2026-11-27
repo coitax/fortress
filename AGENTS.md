@@ -18,8 +18,14 @@ a **drop-in** — swap the browser, keep the automation code. The fingerprint is
 
 **Docker (any OS, nothing to build):**
 ```bash
-docker run -d --rm -p 9222:9222 tilion/fortress:latest
+export TILION_CDP_TOKEN=$(openssl rand -hex 32)
+docker run -d --rm -p 127.0.0.1:9222:9222 -e TILION_CDP_TOKEN tilion/fortress:latest
 ```
+The container's DevTools port requires this debug token on every connection: send
+`Authorization: Bearer <token>` (e.g. Playwright `connect_over_cdp(url, headers={...})`), or append
+`?token=<token>` to a `ws://…/devtools/browser/<id>` URL. If `TILION_CDP_TOKEN` is unset, the container
+generates one and prints it to `docker logs`. The SDKs below do this for you (`f.cdp_url` carries the
+token; `f.cdp_headers` holds the header for the `http://` endpoint).
 
 **Python:**
 ```bash
@@ -110,7 +116,7 @@ f = Fortress(persona={
 })
 ```
 Docker: append the same flags after the image name, e.g.
-`docker run -d --rm -p 9222:9222 tilion/fortress:latest --uxr-timezone=America/New_York --uxr-hw-concurrency=16`
+`docker run -d --rm -p 127.0.0.1:9222:9222 tilion/fortress:latest --uxr-timezone=America/New_York --uxr-hw-concurrency=16`
 
 ---
 

@@ -23,7 +23,7 @@ For the real, current engine:
 
     pip install -U tilion-fortress
     # or
-    docker run --rm -p 9222:9222 tilion/fortress:latest
+    docker run --rm -p 127.0.0.1:9222:9222 tilion/fortress:latest
 
 See the [latest release](https://github.com/tiliondev/fortress/releases/latest) for
 what actually ships.

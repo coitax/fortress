@@ -12,7 +12,7 @@ Docker image; Docker is also the fallback anywhere a native launch isn't availab
         print(f.cdp_url)   # connect any CDP client (Playwright/Puppeteer)
 """
 from __future__ import annotations
-import hashlib, json, os, platform, shutil, subprocess, sys, tarfile, time, urllib.request, zipfile
+import hashlib, json, os, platform, secrets, shutil, subprocess, sys, tarfile, tempfile, time, urllib.request, zipfile
 from pathlib import Path
 
 __version__ = "151.0.7908.0.post4"
@@ -140,7 +140,10 @@ class Fortress:
         self._tag = _CHANNELS[ch]["tag"]
         self._docker = _CHANNELS[ch]["docker"]
         self._host = _host(self._tag)
-        self._proc = self._docker_name = self.cdp_url = None
+        self._proc = self._docker_name = self.cdp_url = self._token = None
+        # Headers a CDP client must send to the http:// endpoint (Docker only;
+        # ``cdp_url`` already carries the token).
+        self.cdp_headers: dict[str, str] = {}
 
     def start(self) -> "Fortress":
         plat = resolve_platform()
@@ -183,17 +186,30 @@ class Fortress:
                 "No native Fortress binary for this platform yet and Docker is not installed. "
                 "Install Docker Desktop, or run on Linux x64.")
         self._docker_name = f"tilion-fortress-{os.getpid()}-{self.port}"
-        args = ["docker", "run", "-d", "--rm", "--name", self._docker_name,
-                "-p", f"{self.port}:9222", self._docker] + _persona_args(self.persona) + self.extra_args
-        subprocess.run(args, check=True, stdout=subprocess.DEVNULL)
+        # The container's DevTools bridge requires this token. Hand it over in an
+        # env file so it is not on the docker command line.
+        self._token = secrets.token_hex(32)
+        self.cdp_headers = {"Authorization": f"Bearer {self._token}"}
+        fd, env_file = tempfile.mkstemp(prefix="tilion-fortress-", suffix=".env")
+        try:
+            with os.fdopen(fd, "w") as fh:
+                fh.write(f"TILION_CDP_TOKEN={self._token}\n")
+            args = ["docker", "run", "-d", "--rm", "--name", self._docker_name,
+                    "--env-file", env_file,
+                    "-p", f"127.0.0.1:{self.port}:9222", self._docker] + _persona_args(self.persona) + self.extra_args
+            subprocess.run(args, check=True, stdout=subprocess.DEVNULL)
+        finally:
+            os.unlink(env_file)
 
     def _wait_cdp(self, timeout: float = 90.0) -> str:
         deadline = time.time() + timeout
-        url = f"http://127.0.0.1:{self.port}/json/version"
+        req = urllib.request.Request(f"http://127.0.0.1:{self.port}/json/version",
+                                     headers=self.cdp_headers)
         while time.time() < deadline:
             try:
-                with urllib.request.urlopen(url, timeout=2) as r:
-                    return json.load(r)["webSocketDebuggerUrl"]
+                with urllib.request.urlopen(req, timeout=2) as r:
+                    ws = json.load(r)["webSocketDebuggerUrl"]
+                return f"{ws}?token={self._token}" if self._token else ws
             except Exception:
                 time.sleep(0.5)
         raise TimeoutError("Fortress CDP endpoint did not come up")
