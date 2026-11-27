@@ -113,7 +113,10 @@ If `tilion-mcp` isn't on PATH, use `"command": "python", "args": ["-m", "tilion.
 | `get_egress_info` | report proxy/region and the real public IP the target sees (verify residential egress) |
 
 Tools carry `readOnlyHint`/`destructiveHint` annotations, so clients auto-approve reads and
-gate writes. Every tool is timeout- and SSRF-guarded, caps its output, and returns a
+gate writes. `get_cookies`, `evaluate_js`, `extract_document`, and `get_stealth_cdp_endpoint`
+hand back session material, run script in a logged-in page, or return file contents, so they
+are annotated as writes and need approval. `extract_document` reads local files only from
+`TILION_MCP_WRITE_DIR` and does not follow symlinks. Every tool is timeout- and SSRF-guarded, caps its output, and returns a
 structured error instead of hanging. The browser is pre-warmed at startup, so the first
 call takes about 100 ms.
 

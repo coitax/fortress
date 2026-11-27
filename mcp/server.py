@@ -27,6 +27,11 @@ _READ = ToolAnnotations(readOnlyHint=True, openWorldHint=True)
 _LOCAL = ToolAnnotations(readOnlyHint=True, openWorldHint=False)
 _WRITE = ToolAnnotations(readOnlyHint=False, openWorldHint=True)
 _DESTRUCTIVE = ToolAnnotations(readOnlyHint=False, destructiveHint=True, openWorldHint=True)
+# Tools whose result is session material (cookies, the live CDP endpoint), that run
+# caller-supplied script inside a logged-in page, or that return local file contents.
+# A client must prompt for these even though they "only read": a prompt-injected page
+# can otherwise have the agent export a session or a file with no human in the loop.
+_SENSITIVE = ToolAnnotations(readOnlyHint=False, destructiveHint=True, openWorldHint=True)
 
 
 def _env(name: str, default: str | None = None) -> str | None:
@@ -105,13 +110,18 @@ async def _check_url(url: str) -> None:
                              "(set TILION_ALLOW_PRIVATE_EGRESS=1 to allow)")
 
 
+def _sandbox_dir() -> str:
+    import tempfile
+    root = _env("MCP_WRITE_DIR") or os.path.join(tempfile.gettempdir(), "tilion-mcp")
+    return os.path.abspath(root)
+
+
 def _write_root() -> str:
     """The directory tool-written files are confined to. Override with
     TILION_MCP_WRITE_DIR; defaults to <tempdir>/tilion-mcp."""
-    import tempfile
-    root = _env("MCP_WRITE_DIR") or os.path.join(tempfile.gettempdir(), "tilion-mcp")
+    root = _sandbox_dir()
     os.makedirs(root, exist_ok=True)
-    return os.path.abspath(root)
+    return root
 
 
 def _confine_path(path: str | None, suffix: str) -> str:
@@ -131,6 +141,100 @@ def _confine_path(path: str | None, suffix: str) -> str:
     if not os.path.splitext(name)[1]:
         name += suffix
     return os.path.join(root, name)
+
+
+_OPENAT = (os.open in os.supports_dir_fd
+           and hasattr(os, "O_NOFOLLOW") and hasattr(os, "O_DIRECTORY"))
+
+
+def _refuse_read(source: str, why: str) -> PermissionError:
+    return PermissionError(f"refused local document {source!r}: {why}. Local documents "
+                           f"are read only from {_sandbox_dir()} (TILION_MCP_WRITE_DIR), "
+                           "e.g. files fetched with download_file")
+
+
+def _read_sandboxed(source: str) -> bytes:
+    """Read a local document that lives inside the sandbox root and return its bytes.
+
+    The check is bound to the file actually read, not to a path that is opened again
+    later: the path is walked from a descriptor on the root one component at a time
+    with O_NOFOLLOW, so `..`, symlinks, and a link swapped after any earlier check
+    can't reach outside the root. Without openat (Windows) the opened handle's final
+    path is checked instead."""
+    configured = os.path.normcase(_sandbox_dir())
+    real_root = os.path.normcase(os.path.realpath(configured))
+    target = os.path.normcase(os.path.abspath(source))
+    rel = None
+    for base in (configured, real_root):
+        try:
+            if os.path.commonpath([target, base]) == base:
+                rel = os.path.relpath(target, base)
+                break
+        except ValueError:                    # different drives (Windows)
+            continue
+    if rel is None or rel == os.curdir:
+        raise _refuse_read(source, "outside the sandbox")
+    parts = rel.split(os.sep)
+    if any(p in ("", os.curdir, os.pardir) for p in parts):
+        raise _refuse_read(source, "outside the sandbox")
+
+    import stat
+    if _OPENAT:
+        flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
+        dfd = os.open(real_root, flags | os.O_DIRECTORY)
+        try:
+            for part in parts[:-1]:
+                nfd = os.open(part, flags | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=dfd)
+                os.close(dfd)
+                dfd = nfd
+            fd = os.open(parts[-1], flags | os.O_NOFOLLOW | getattr(os, "O_NONBLOCK", 0),
+                         dir_fd=dfd)
+        except OSError as exc:
+            import errno
+            if exc.errno in (errno.ELOOP, errno.ENOTDIR, getattr(errno, "EMLINK", -1)):
+                raise _refuse_read(source, "symlinks are not followed") from None
+            raise
+        finally:
+            os.close(dfd)
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            os.close(fd)
+            raise _refuse_read(source, "not a regular file")
+        with os.fdopen(fd, "rb") as fh:
+            return fh.read()
+    if os.name == "nt":
+        with open(target, "rb") as fh:
+            final = os.path.normcase(_final_path(fh.fileno()))
+            try:
+                inside = os.path.commonpath([final, real_root]) == real_root
+            except ValueError:
+                inside = False
+            if not inside or final == real_root:
+                raise _refuse_read(source, "resolves outside the sandbox")
+            if not stat.S_ISREG(os.fstat(fh.fileno()).st_mode):
+                raise _refuse_read(source, "not a regular file")
+            return fh.read()
+    raise _refuse_read(source, "this platform cannot open files without following links")
+
+
+def _final_path(fd: int) -> str:
+    """The path of the file an open descriptor refers to, with every link resolved."""
+    import ctypes
+    import msvcrt
+    from ctypes import wintypes
+    fn = ctypes.windll.kernel32.GetFinalPathNameByHandleW
+    fn.argtypes = [wintypes.HANDLE, wintypes.LPWSTR, wintypes.DWORD, wintypes.DWORD]
+    fn.restype = wintypes.DWORD
+    size = 32768
+    buf = ctypes.create_unicode_buffer(size)
+    n = fn(msvcrt.get_osfhandle(fd), buf, size, 0)
+    if not n or n >= size:
+        raise ctypes.WinError()
+    path = buf.value
+    if path.startswith("\\\\?\\UNC\\"):
+        return "\\\\" + path[8:]
+    if path.startswith("\\\\?\\"):
+        return path[4:]
+    return path
 
 
 async def _log(ctx, msg: str) -> None:
@@ -473,18 +577,27 @@ async def current_page() -> dict:
     return await t.current()
 
 
-@mcp.tool(annotations=_READ)
+@mcp.tool(annotations=_SENSITIVE)
 @_safe
 async def extract_document(source: str) -> dict:
     """Extract clean text/markdown + tables from a DOCUMENT — a PDF, DOCX, XLSX, CSV,
-    or HTML file, given a local path OR a URL (even one behind bot detection). Use for
-    reports, datasheets, filings, or any file the agent must read.
+    or HTML file, given a URL (even one behind bot detection) OR a local path inside
+    the server's sandbox directory (TILION_MCP_WRITE_DIR, where download_file saves).
+    Use for reports, datasheets, filings, or any file the agent must read.
     """
-    t = await _t()
-    is_url = source[:4].lower() == "http"
-    if is_url:
+    if source[:4].lower() == "http":
         await _check_url(source)
-    r = await (t.extract_url(source) if is_url else t.extract_file(source))
+        t = await _t()
+        r = await t.extract_url(source)
+    else:
+        import mimetypes
+        from tilion.core.scraping.extractor import Extractor
+        data = await asyncio.to_thread(_read_sandboxed, source)
+        t = await _t()
+        t._require_local("extract_file")
+        res = await Extractor().extract_file(data, mime_type=mimetypes.guess_type(source)[0])
+        res.source_url = source
+        r = t._extraction_dict(res)
     r.pop("html", None)
     return _cap(r, {"markdown": 40000, "text": 20000})
 
@@ -499,7 +612,7 @@ async def get_page_html(url: str) -> dict:
     return _cap(await t.get_html(url), {"html": 80000})
 
 
-@mcp.tool(annotations=_READ)
+@mcp.tool(annotations=_SENSITIVE)
 @_safe
 async def evaluate_js(expression: str, url: str | None = None) -> dict:
     """Run a JavaScript expression on the current (or a navigated) page and return its
@@ -537,7 +650,7 @@ async def download_file(url: str, filename: str) -> dict:
     return await t.download(url, dest)
 
 
-@mcp.tool(annotations=_READ)
+@mcp.tool(annotations=_SENSITIVE)
 @_safe
 async def get_cookies(url: str | None = None) -> dict:
     """Get the cookies on the current (or a navigated) page — inspect or export an
@@ -646,7 +759,7 @@ async def get_egress_info() -> dict:
     return info
 
 
-@mcp.tool(annotations=_READ)
+@mcp.tool(annotations=_SENSITIVE)
 @_safe
 async def get_stealth_cdp_endpoint() -> dict:
     """Return a Chrome DevTools Protocol (CDP) websocket URL for a running stealth
