@@ -96,7 +96,7 @@ If `tilion-mcp` isn't on PATH, use `"command": "python", "args": ["-m", "tilion.
 | `fetch_protected_page` | get a page behind Cloudflare / DataDome / 403 / CAPTCHA |
 | `read_page` | clean reader-mode markdown of any page, tables included |
 | `extract_page` | markdown + tables + metadata (or a schema-shaped record) |
-| `extract_document` | convert a PDF/DOCX/XLSX/CSV/HTML file (path or URL) to markdown |
+| `extract_document` | convert a PDF/DOCX/XLSX/CSV/HTML file (URL, or a file name in the sandbox dir `TILION_MCP_WRITE_DIR`) to markdown |
 | `page_elements` | the page's buttons / links / fields / headings |
 | `click_button` · `fill_field` · `press_key` | drive a form by visible text / selector / key |
 | `current_page` · `get_page_html` · `evaluate_js` · `wait_for` | inspect / script / wait on the working page |
