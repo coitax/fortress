@@ -12,9 +12,12 @@ from __future__ import annotations
 
 import asyncio
 import functools
+import ipaddress
 import os
+import re
 import sys
 from contextlib import asynccontextmanager
+from urllib.parse import unquote_to_bytes
 
 from mcp.server.fastmcp import Context, FastMCP
 from mcp.types import ToolAnnotations
@@ -61,48 +64,173 @@ def _safe(fn):
     return wrap
 
 
+# Cloud metadata / wire-server endpoints. Some of these are "global" to Python's
+# ipaddress flags (Azure's 168.63.129.16 always; Oracle's 192.0.0.192 on older
+# Pythons), so they are denied by address.
+_METADATA_NETS = tuple(ipaddress.ip_network(n) for n in (
+    "169.254.169.254/32",   # AWS / GCP / Azure / OpenStack / DigitalOcean IMDS
+    "169.254.170.2/32",     # AWS ECS task metadata
+    "169.254.170.23/32",    # AWS EKS Pod Identity
+    "168.63.129.16/32",     # Azure WireServer
+    "192.0.0.192/32",       # Oracle Cloud metadata
+    "100.100.100.200/32",   # Alibaba Cloud metadata
+    "fd00:ec2::254/128",    # AWS IMDS over IPv6
+    "fd00:ec2::23/128",     # AWS EKS Pod Identity over IPv6
+    "fd20:ce::254/128",     # GCP metadata over IPv6
+    "fd00:c1::a9fe:a9fe/128",  # Oracle Cloud metadata over IPv6
+))
+_METADATA_HOSTS = frozenset({
+    "localhost", "metadata", "metadata.google.internal", "metadata.tencentyun.com",
+})
+_NAT64 = ipaddress.ip_network("64:ff9b::/96")
+_C0_OR_SPACE = "".join(map(chr, range(0x21)))
+_TAB_OR_NEWLINE = re.compile(r"[\t\n\r]")
+_HTTP_SCHEME = re.compile(r"(https?):", re.IGNORECASE)
+_HOST_CHARS = re.compile(r"[a-z0-9_.\-]+")
+_IPV4_LAST_PART = re.compile(r"[0-9]+|0x[0-9a-f]*")
+_IPV4_DIGITS = {16: re.compile(r"[0-9a-f]*"), 8: re.compile(r"[0-7]*"), 10: re.compile(r"[0-9]+")}
+_ALLOW_HINT = "(set TILION_ALLOW_PRIVATE_EGRESS=1 to allow)"
+
+
+def _addr_blocked(ip: ipaddress.IPv4Address | ipaddress.IPv6Address) -> bool:
+    return (any(ip in net for net in _METADATA_NETS if net.version == ip.version)
+            or not ip.is_global or ip.is_private or ip.is_loopback or ip.is_link_local
+            or ip.is_reserved or ip.is_multicast or ip.is_unspecified)
+
+
 def _ip_blocked(ip_str: str) -> bool:
-    import ipaddress
     try:
         ip = ipaddress.ip_address(ip_str)
     except ValueError:
         return False
-    # normalise IPv4-mapped IPv6 (::ffff:169.254.169.254) to the v4 checks
-    if getattr(ip, "ipv4_mapped", None) is not None:
-        ip = ip.ipv4_mapped
-    return (ip.is_private or ip.is_loopback or ip.is_link_local
-            or ip.is_reserved or ip.is_multicast or ip.is_unspecified)
+    if ip.version == 6:
+        # an IPv4-mapped literal (::ffff:a.b.c.d) is an IPv4 destination
+        if ip.ipv4_mapped is not None:
+            return _addr_blocked(ip.ipv4_mapped)
+        # 6to4, Teredo, NAT64 and IPv4-compatible forms also carry an IPv4 target
+        carried = [ip.sixtofour, *(ip.teredo or ())]
+        if ip in _NAT64 or ip.packed[:12] == bytes(12):
+            carried.append(ipaddress.IPv4Address(ip.packed[12:]))
+        if any(_addr_blocked(v4) for v4 in carried if v4 is not None):
+            return True
+    return _addr_blocked(ip)
 
 
-async def _check_url(url: str) -> None:
+def _parse_ipv4(host: str) -> ipaddress.IPv4Address | None:
+    """WHATWG URL IPv4 host parsing, which Chromium applies: 1-4 dot-separated
+    parts in decimal, 0x-hex or 0-octal, the last part filling the remaining bytes,
+    one trailing dot allowed. None when ``host`` is a domain name; ValueError when it
+    ends in a number but is not a valid address (the browser rejects those too)."""
+    parts = host.split(".")
+    if parts[-1] == "" and len(parts) > 1:
+        parts.pop()
+    if not _IPV4_LAST_PART.fullmatch(parts[-1]):
+        return None
+    if len(parts) > 4:
+        raise ValueError(f"refused invalid IPv4 host {host!r}")
+    numbers = []
+    for part in parts:
+        if part.startswith("0x"):
+            digits, base = part[2:], 16
+        elif len(part) > 1 and part.startswith("0"):
+            digits, base = part[1:], 8
+        else:
+            digits, base = part, 10
+        if not _IPV4_DIGITS[base].fullmatch(digits):
+            raise ValueError(f"refused invalid IPv4 host {host!r}")
+        numbers.append(int(digits, base) if digits else 0)
+    if any(n > 255 for n in numbers[:-1]) or numbers[-1] >= 256 ** (5 - len(numbers)):
+        raise ValueError(f"refused invalid IPv4 host {host!r}")
+    value = numbers[-1]
+    for i, n in enumerate(numbers[:-1]):
+        value += n << (8 * (3 - i))
+    return ipaddress.IPv4Address(value)
+
+
+def _canonical_host(raw: str) -> tuple[str, ipaddress.IPv4Address | ipaddress.IPv6Address | None]:
+    """Canonicalize a URL host the way the browser does: IPv6 literal, or
+    percent-decode + IDNA-map + IPv4 number parsing. Returns (host, ip-or-None)."""
+    if raw.startswith("["):
+        inner = raw[1:-1]
+        try:
+            if not raw.endswith("]") or "%" in inner:
+                raise ValueError
+            ip6 = ipaddress.IPv6Address(inner)
+        except ValueError:
+            raise ValueError(f"refused invalid IPv6 host {raw!r}") from None
+        return f"[{ip6.compressed}]", ip6
+    try:
+        host = unquote_to_bytes(raw).decode("utf-8").encode("idna").decode("ascii").lower()
+    except (UnicodeError, ValueError):
+        raise ValueError(f"refused invalid url host {raw!r}") from None
+    if not _HOST_CHARS.fullmatch(host):
+        raise ValueError(f"refused invalid url host {raw!r}")
+    ip4 = _parse_ipv4(host)
+    return (str(ip4), ip4) if ip4 is not None else (host, None)
+
+
+def _canonical_url(url: str) -> tuple[str, str, ipaddress.IPv4Address | ipaddress.IPv6Address | None]:
+    """Split ``url`` as the browser's URL parser would (control/space trimming, tab
+    and newline removal, backslashes as slashes, any number of slashes after the
+    scheme, last '@' ends the userinfo) and rebuild it around the canonical host.
+    Returns (rebuilt url, host, ip-or-None)."""
+    s = _TAB_OR_NEWLINE.sub("", url.strip(_C0_OR_SPACE))
+    m = _HTTP_SCHEME.match(s)
+    if not m:
+        raise ValueError(f"refused non-http(s) url: {url!r}")
+    rest = s[m.end():]
+    q = re.search(r"[?#]", rest)
+    cut = q.start() if q else len(rest)
+    rest = rest[:cut].replace("\\", "/").lstrip("/") + rest[cut:]
+    end = re.search(r"[/?#]", rest)
+    authority, tail = (rest[:end.start()], rest[end.start():]) if end else (rest, "")
+    userinfo, at, hostport = authority.rpartition("@")
+    if hostport.startswith("["):
+        close = hostport.find("]")
+        raw_host, port = (hostport, "") if close < 0 else (hostport[:close + 1], hostport[close + 1:])
+    else:
+        raw_host, colon, port = hostport.partition(":")
+        port = colon + port
+    if not raw_host:
+        raise ValueError(f"refused url without a host: {url!r}")
+    if port and not (port.startswith(":") and re.fullmatch(r"[0-9]*", port[1:])
+                     and (port == ":" or int(port[1:]) <= 65535)):
+        raise ValueError(f"refused invalid url port: {url!r}")
+    host, ip = _canonical_host(raw_host)
+    rebuilt = f"{m.group(1).lower()}://{userinfo + '@' if at else ''}{host}{port}{tail}"
+    return rebuilt, host, ip
+
+
+async def _check_url(url: str) -> str:
     """SSRF guard for the local MCP: refuse localhost / private / cloud-metadata
     targets unless the operator opts in with TILION_ALLOW_PRIVATE_EGRESS=1.
+
+    Returns the URL rebuilt around the host that was checked; callers must navigate
+    to that return value, not to the raw input, so the browser cannot read a
+    different host out of the same string.
 
     DNS resolution goes through the event loop's ASYNC resolver — a blocking
     socket.getaddrinfo here would stall every concurrent tool call and could not
     be cancelled by the per-tool timeout."""
     if _env("ALLOW_PRIVATE_EGRESS", "0") == "1":
-        return
-    from urllib.parse import urlparse
-
-    host = (urlparse(url).hostname or "").strip("[]")
-    if not host:
-        raise ValueError(f"invalid url: {url!r}")
-    if host.lower() in ("localhost", "metadata.google.internal"):
-        raise ValueError(f"refused private/metadata host {host!r} "
-                         "(set TILION_ALLOW_PRIVATE_EGRESS=1 to allow)")
-    if _ip_blocked(host):                     # host is already a literal IP
-        raise ValueError(f"refused private/internal address {host!r} "
-                         "(set TILION_ALLOW_PRIVATE_EGRESS=1 to allow)")
+        return url
+    checked, host, ip = _canonical_url(url)
+    if ip is not None:
+        if _ip_blocked(str(ip)):
+            raise ValueError(f"refused private/internal address {host!r} {_ALLOW_HINT}")
+        return checked
+    name = host.rstrip(".")
+    if name in _METADATA_HOSTS or name.endswith(".localhost"):
+        raise ValueError(f"refused private/metadata host {host!r} {_ALLOW_HINT}")
     try:
         loop = asyncio.get_running_loop()
         infos = await loop.getaddrinfo(host, None)
     except Exception:
-        return  # unresolvable → let the browser surface a clean nav error
+        return checked  # unresolvable → let the browser surface a clean nav error
     for info in infos:
         if _ip_blocked(info[4][0]):
-            raise ValueError(f"refused private/internal address for {host!r} "
-                             "(set TILION_ALLOW_PRIVATE_EGRESS=1 to allow)")
+            raise ValueError(f"refused private/internal address for {host!r} {_ALLOW_HINT}")
+    return checked
 
 
 def _write_root() -> str:
@@ -143,11 +271,20 @@ async def _log(ctx, msg: str) -> None:
             pass
 
 
-async def _check_params_urls(params: dict | None) -> None:
-    """Defense-in-depth: SSRF-check any URL-looking values a flow might navigate to."""
-    for v in (params or {}).values():
-        if isinstance(v, str) and v[:8].lower().startswith(("http://", "https:/")):
-            await _check_url(v)
+async def _check_params_urls(params: dict | None) -> dict:
+    """Defense-in-depth: SSRF-check any http(s) URL a flow might navigate to, at any
+    nesting depth, and return the params with each URL replaced by its checked form."""
+    async def walk(v):
+        if isinstance(v, str):
+            if _HTTP_SCHEME.match(_TAB_OR_NEWLINE.sub("", v.lstrip(_C0_OR_SPACE))):
+                return await _check_url(v)
+            return v
+        if isinstance(v, dict):
+            return {k: await walk(x) for k, x in v.items()}
+        if isinstance(v, (list, tuple)):
+            return type(v)([await walk(x) for x in v])
+        return v
+    return {k: await walk(v) for k, v in (params or {}).items()}
 
 
 @asynccontextmanager
@@ -247,7 +384,7 @@ async def fetch_protected_page(url: str) -> dict:
     dropped from the response to save context — use extract_page for structured
     content.)
     """
-    await _check_url(url)
+    url = await _check_url(url)
     t = await _t()
     r = await t.fetch(url)
     r.pop("html", None)                       # agents want text, not a raw-HTML dump
@@ -270,8 +407,8 @@ async def run_browser_task(task: str, url: str, params: dict | None = None) -> d
         return {"status": "error",
                 "error": f"unknown task {task!r}; call list_browser_tasks for valid names"}
     if url:
-        await _check_url(url)
-    await _check_params_urls(params)          # SSRF-check URL-bearing flow params too
+        url = await _check_url(url)
+    params = await _check_params_urls(params)  # SSRF-check URL-bearing flow params too
     t = await _t()
     return await t.agent(task, url=url, **(params or {}))
 
@@ -307,7 +444,7 @@ async def extract_page(url: str, schema: dict | None = None) -> dict:
     `schema` is given). Use instead of raw HTML scraping when you want structured,
     readable content and the site blocks normal scrapers.
     """
-    await _check_url(url)
+    url = await _check_url(url)
     t = await _t()
     r = await t.extract(url, schema=schema)
     r.pop("html", None)
@@ -322,7 +459,7 @@ async def crawl_site(url: str, depth: int = 2, max_pages: int = 100,
     stealth browser and return every discovered page/document + a sitemap. Use to
     map or harvest a site that blocks conventional crawlers.
     """
-    await _check_url(url)
+    url = await _check_url(url)
     depth = max(1, min(int(depth), 5))            # clamp: unbounded depth can run away
     max_pages = max(1, min(int(max_pages), 500))
     if ctx:
@@ -347,7 +484,7 @@ async def recon_site_apis(url: str, duration: float = 20.0,
     (secret-scrubbed). Use when you want to hit a site's real backend API directly
     instead of scraping HTML.
     """
-    await _check_url(url)
+    url = await _check_url(url)
     duration = max(1.0, min(float(duration), 60.0))   # clamp: capture window bounded
     if ctx:
         await _log(ctx, f"capturing {url} network for {duration:.0f}s…")
@@ -366,7 +503,7 @@ async def screenshot_page(url: str, path: str | None = None) -> dict:
     """Screenshot a page (that may be behind bot detection) as PNG. Writes to
     `path` if given, else returns base64 (large images are saved to a temp file
     instead, to avoid flooding context). Use for visual verification/QA."""
-    await _check_url(url)
+    url = await _check_url(url)
     if path is not None:
         path = _confine_path(path, ".png")       # sandbox the write path
     t = await _t()
@@ -388,7 +525,7 @@ async def screenshot_page(url: str, path: str | None = None) -> dict:
 async def save_page(url: str, path: str, format: str = "pdf") -> dict:
     """Save a page (behind bot detection or not) as pdf | html | text | screenshot
     to `path`. Use to archive/export a protected page as a PDF."""
-    await _check_url(url)
+    url = await _check_url(url)
     allowed = {"pdf", "html", "text", "screenshot", "png"}
     if format not in allowed:
         return {"status": "error", "error": f"format must be one of {sorted(allowed)}"}
@@ -405,7 +542,7 @@ async def read_page(url: str) -> dict:
     readable article/content as markdown plus any tables. Use to read a page's
     content without the HTML noise. Returns {url, title, markdown, tables}.
     """
-    await _check_url(url)
+    url = await _check_url(url)
     t = await _t()
     r = await t.read(url)
     return _cap(r, {"markdown": 40000})
@@ -419,7 +556,7 @@ async def page_elements(url: str) -> dict:
     fill before calling click_button / fill_field. Returns
     {url, buttons[], links[], fields[], headings[]}.
     """
-    await _check_url(url)
+    url = await _check_url(url)
     t = await _t()
     return await t.elements(url)
 
@@ -432,7 +569,7 @@ async def click_button(text: str, url: str | None = None) -> dict:
     Returns the resulting {clicked, url, title}.
     """
     if url:
-        await _check_url(url)
+        url = await _check_url(url)
     t = await _t()
     return await t.click(text, url=url)
 
@@ -447,7 +584,7 @@ async def fill_field(field: str, value: str, url: str | None = None,
     find field selectors.
     """
     if url:
-        await _check_url(url)
+        url = await _check_url(url)
     t = await _t()
     return await t.fill(field, value, url=url, submit=submit)
 
@@ -483,7 +620,7 @@ async def extract_document(source: str) -> dict:
     t = await _t()
     is_url = source[:4].lower() == "http"
     if is_url:
-        await _check_url(source)
+        source = await _check_url(source)
     r = await (t.extract_url(source) if is_url else t.extract_file(source))
     r.pop("html", None)
     return _cap(r, {"markdown": 40000, "text": 20000})
@@ -494,7 +631,7 @@ async def extract_document(source: str) -> dict:
 async def get_page_html(url: str) -> dict:
     """Get the RAW HTML of a page (behind bot detection or not). Use when you need the
     exact markup rather than cleaned markdown. Returns {url, html} (capped)."""
-    await _check_url(url)
+    url = await _check_url(url)
     t = await _t()
     return _cap(await t.get_html(url), {"html": 80000})
 
@@ -507,7 +644,7 @@ async def evaluate_js(expression: str, url: str | None = None) -> dict:
     `Array.from(document.querySelectorAll('.price')).map(e=>e.innerText)`.
     """
     if url:
-        await _check_url(url)
+        url = await _check_url(url)
     t = await _t()
     return await t.evaluate(expression, url=url)
 
@@ -518,7 +655,7 @@ async def wait_for(selector: str, url: str | None = None, timeout_ms: int = 1000
     """Wait for a CSS selector to appear (navigates to `url` first if given). Use
     before reading a page whose content loads late via JavaScript."""
     if url:
-        await _check_url(url)
+        url = await _check_url(url)
     timeout_ms = max(500, min(int(timeout_ms), 60000))
     t = await _t()
     return await t.wait_for(selector, url=url, timeout_ms=timeout_ms)
@@ -530,7 +667,7 @@ async def download_file(url: str, filename: str) -> dict:
     """Download a file (preserving the stealth browser's cookies/session) to a
     sandboxed path. Use for PDFs/CSVs/exports behind auth or bot detection.
     Returns {url, path, bytes}."""
-    await _check_url(url)
+    url = await _check_url(url)
     ext = os.path.splitext(filename)[1] or ".bin"
     dest = _confine_path(filename, ext)
     t = await _t()
@@ -543,7 +680,7 @@ async def get_cookies(url: str | None = None) -> dict:
     """Get the cookies on the current (or a navigated) page — inspect or export an
     authenticated session. Returns {cookies:[...]}."""
     if url:
-        await _check_url(url)
+        url = await _check_url(url)
     t = await _t()
     return {"cookies": await t.get_cookies(url=url)}
 
@@ -603,7 +740,7 @@ async def detect_waf(url: str | None = None) -> dict:
     right strategy automatically and returns the same `waf` info.
     """
     if url:
-        await _check_url(url)
+        url = await _check_url(url)
     t = await _t()
     return await t.detect_waf(url)
 
@@ -619,7 +756,7 @@ async def solve_captcha(url: str | None = None) -> dict:
     auto-solves when a key is set; use this for an explicit retry on an interactive page.
     """
     if url:
-        await _check_url(url)
+        url = await _check_url(url)
     t = await _t()
     return await t.solve_captcha(url)
 
