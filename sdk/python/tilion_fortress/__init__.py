@@ -126,6 +126,39 @@ def _persona_args(persona: dict | None) -> list[str]:
     return [f"{mapping.get(k, '--uxr-' + k.replace('_', '-'))}={v}" for k, v in persona.items()]
 
 
+# Mirrors packaging/tilion.cmd. On Windows the SDK starts chrome.exe directly instead of that
+# launcher: a .cmd file can only run under cmd.exe, which would parse persona values and
+# extra_args as shell syntax. Keep the flags and their order in sync with tilion.cmd.
+_WIN_DEFAULT_ARGS = [
+    "--uxr-platform=Win32", "--uxr-ua-platform=Windows", "--uxr-ua-os=Windows NT 10.0; Win64; x64",
+    "--uxr-ua-arch=x86", "--uxr-ua-bitness=64", "--uxr-ua-platform-version=15.0.0",
+    "--uxr-ua-brand=Google Chrome",
+    "--uxr-hw-concurrency=16", "--uxr-device-memory=8",
+    "--uxr-webgl-vendor=Google Inc. (NVIDIA)",
+    "--uxr-webgl-renderer=ANGLE (NVIDIA, NVIDIA GeForce RTX 3060 Direct3D11 vs_5_0 ps_5_0, D3D11)",
+    "--uxr-webgl-fullparams=1", "--uxr-canvas-seed=778899", "--uxr-audio-seed=445566",
+    "--uxr-timezone=America/New_York", "--uxr-languages=en-US,en", "--accept-lang=en-US,en",
+    "--uxr-screen-width=1920", "--uxr-screen-height=1080",
+    "--uxr-webrtc-policy=disable_non_proxied_udp",
+    "--enable-unsafe-webgpu", "--enable-features=Vulkan", "--use-webgpu-adapter=swiftshader",
+    "--enable-dawn-features=use_vulkan", "--uxr-webgpu-vendor=nvidia",
+    "--uxr-webgpu-architecture=ampere", "--uxr-webgpu-description=NVIDIA GeForce RTX 3060",
+]
+
+
+def _windows_launch(launcher: Path, flags: list[str],
+                    env: dict | None = None) -> tuple[list[str], dict]:
+    """Return the chrome.exe argv and environment that ``tilion.cmd`` would have used."""
+    env = dict(os.environ if env is None else env)
+    here = Path(launcher).parent
+    exe = here / "chrome.exe"
+    if not exe.exists():
+        raise RuntimeError(f"chrome.exe missing from bundle: {exe}")
+    defaults = [] if env.get("TILION_NO_DEFAULTS") else _WIN_DEFAULT_ARGS
+    env["VK_ICD_FILENAMES"] = str(here / "vk_swiftshader_icd.json")
+    return [str(exe), "--use-angle=swiftshader", *defaults, *flags], env
+
+
 class Fortress:
     """A running Fortress instance exposing a CDP endpoint at ``cdp_url``."""
 
@@ -168,14 +201,14 @@ class Fortress:
         if self.headless:
             flags += ["--headless=new", "--no-sandbox"]
         flags += [f"--remote-debugging-port={self.port}", f"--user-data-dir={_CACHE / 'profile'}"]
-        flags += _persona_args(self.persona) + self.extra_args
-        # A Windows .cmd launcher cannot be spawned directly by CreateProcess
-        # (WinError 193); run it through cmd.exe. POSIX launchers exec in place.
-        if str(launcher).lower().endswith(".cmd"):
-            args = ["cmd", "/c", str(launcher)] + flags
+        flags += _persona_args(self.persona) + list(self.extra_args)
+        env = None
+        if plat == "win-x64":
+            args, env = _windows_launch(launcher, flags)
         else:
             args = [str(launcher)] + flags
-        self._proc = subprocess.Popen(args, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        self._proc = subprocess.Popen(args, env=env,
+                                      stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
     def _start_docker(self):
         if not shutil.which("docker"):
@@ -200,8 +233,8 @@ class Fortress:
 
     def close(self):
         if self._proc:
-            # On Windows the launcher runs under cmd.exe; terminate() would only
-            # kill cmd and orphan chrome.exe, so kill the whole process tree.
+            # On Windows terminate() only ends the browser process and orphans
+            # its child processes, so kill the whole process tree.
             if os.name == "nt":
                 subprocess.run(["taskkill", "/F", "/T", "/PID", str(self._proc.pid)],
                                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
