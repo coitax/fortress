@@ -11,6 +11,7 @@ hosted fleet.
 from __future__ import annotations
 
 import asyncio
+import contextvars
 import functools
 import os
 import sys
@@ -64,45 +65,460 @@ def _safe(fn):
 def _ip_blocked(ip_str: str) -> bool:
     import ipaddress
     try:
-        ip = ipaddress.ip_address(ip_str)
+        ip = ipaddress.ip_address(ip_str.split("%", 1)[0])
     except ValueError:
         return False
-    # normalise IPv4-mapped IPv6 (::ffff:169.254.169.254) to the v4 checks
-    if getattr(ip, "ipv4_mapped", None) is not None:
-        ip = ip.ipv4_mapped
-    return (ip.is_private or ip.is_loopback or ip.is_link_local
+    if ip.version == 6:
+        # IPv6 forms that carry an IPv4 destination are judged by that IPv4 address:
+        # mapped (::ffff:a.b.c.d), NAT64 (64:ff9b::a.b.c.d) and 6to4 (2002:aabb:ccdd::).
+        if ip.ipv4_mapped is not None:
+            ip = ip.ipv4_mapped
+        elif ip in ipaddress.ip_network("64:ff9b::/96"):
+            ip = ipaddress.IPv4Address(int(ip) & 0xFFFFFFFF)
+        elif ip.sixtofour is not None:
+            ip = ip.sixtofour
+    return (not ip.is_global or ip.is_private or ip.is_loopback or ip.is_link_local
             or ip.is_reserved or ip.is_multicast or ip.is_unspecified)
 
 
-async def _check_url(url: str) -> None:
-    """SSRF guard for the local MCP: refuse localhost / private / cloud-metadata
-    targets unless the operator opts in with TILION_ALLOW_PRIVATE_EGRESS=1.
+class _EgressRefused(PermissionError):
+    pass
+
+
+def _private_egress_allowed() -> bool:
+    return _env("ALLOW_PRIVATE_EGRESS", "0") == "1"
+
+
+async def _resolve_public(host: str, port: int) -> list[tuple[int, str]]:
+    """Resolve ``host`` ONCE and return the (family, address) pairs a connection may
+    use. Raises _EgressRefused if the host is a blocked name or ANY address is
+    internal. Callers must connect to exactly the returned addresses — never resolve
+    the name again — so a DNS answer that changes between check and connect (DNS
+    rebinding) cannot reach an internal address.
 
     DNS resolution goes through the event loop's ASYNC resolver — a blocking
     socket.getaddrinfo here would stall every concurrent tool call and could not
     be cancelled by the per-tool timeout."""
-    if _env("ALLOW_PRIVATE_EGRESS", "0") == "1":
+    import ipaddress
+    import socket
+
+    host = (host or "").strip().strip("[]")
+    if not host:
+        raise _EgressRefused("refused empty host")
+    try:
+        literal = ipaddress.ip_address(host.split("%", 1)[0])
+    except ValueError:
+        literal = None
+    allow = _private_egress_allowed()
+    if literal is not None:
+        if not allow and _ip_blocked(host):
+            raise _EgressRefused(f"refused private/internal address {host!r} "
+                                 "(set TILION_ALLOW_PRIVATE_EGRESS=1 to allow)")
+        fam = socket.AF_INET6 if literal.version == 6 else socket.AF_INET
+        return [(fam, host)]
+    if not allow and host.lower().rstrip(".") in ("localhost", "metadata.google.internal"):
+        raise _EgressRefused(f"refused private/metadata host {host!r} "
+                             "(set TILION_ALLOW_PRIVATE_EGRESS=1 to allow)")
+    loop = asyncio.get_running_loop()
+    infos = await loop.getaddrinfo(host, port or None, type=socket.SOCK_STREAM)
+    out: list[tuple[int, str]] = []
+    for family, _type, _proto, _canon, sockaddr in infos:
+        addr = sockaddr[0]
+        if not allow and _ip_blocked(addr):
+            raise _EgressRefused(f"refused private/internal address for {host!r} "
+                                 "(set TILION_ALLOW_PRIVATE_EGRESS=1 to allow)")
+        if (family, addr) not in out:
+            out.append((family, addr))
+    if not out:
+        raise OSError(f"no addresses for {host!r}")
+    return out
+
+
+async def _check_url(url: str) -> None:
+    """Early, readable refusal of a caller-supplied localhost / private /
+    cloud-metadata URL unless the operator opts in with
+    TILION_ALLOW_PRIVATE_EGRESS=1. This only covers the first hop; every
+    connection the browser or a download makes (redirects, crawled links,
+    sub-resources) is enforced separately by _EgressGuard / _GuardedHTTP."""
+    if _private_egress_allowed():
         return
     from urllib.parse import urlparse
 
     host = (urlparse(url).hostname or "").strip("[]")
     if not host:
         raise ValueError(f"invalid url: {url!r}")
-    if host.lower() in ("localhost", "metadata.google.internal"):
-        raise ValueError(f"refused private/metadata host {host!r} "
-                         "(set TILION_ALLOW_PRIVATE_EGRESS=1 to allow)")
-    if _ip_blocked(host):                     # host is already a literal IP
-        raise ValueError(f"refused private/internal address {host!r} "
-                         "(set TILION_ALLOW_PRIVATE_EGRESS=1 to allow)")
     try:
-        loop = asyncio.get_running_loop()
-        infos = await loop.getaddrinfo(host, None)
+        await _resolve_public(host, 0)
+    except _EgressRefused as exc:
+        raise ValueError(str(exc)) from None
     except Exception:
         return  # unresolvable → let the browser surface a clean nav error
-    for info in infos:
-        if _ip_blocked(info[4][0]):
-            raise ValueError(f"refused private/internal address for {host!r} "
-                             "(set TILION_ALLOW_PRIVATE_EGRESS=1 to allow)")
+
+
+# ── egress enforcement on every hop ──────────────────────────────────────────
+# The browser follows redirects, crawled links and sub-resource loads on its own,
+# and the facade's downloaders follow redirects inside aiohttp, so checking the
+# caller's URL is not enough. Every TCP connection the stealth browser opens goes
+# through _EgressGuard (a loopback-only SOCKS5 relay), and every in-process HTTP
+# fetch of a caller-influenced URL goes through _GuardedHTTP. Both resolve each
+# destination once with _resolve_public and connect to exactly those addresses.
+
+_SOCKS_OK, _SOCKS_RULESET, _SOCKS_UNREACHABLE = 0, 2, 4
+_SOCKS_REFUSED, _SOCKS_BAD_CMD, _SOCKS_BAD_ATYP = 5, 7, 8
+
+
+class _EgressGuard:
+    """SOCKS5 relay on 127.0.0.1 that the stealth browser is launched behind (with
+    loopback NOT bypassed). Each CONNECT is resolved once, refused if any address is
+    internal, and relayed to the validated address — directly, or through the
+    operator's TILION_PROXY via an HTTP CONNECT to that same address."""
+
+    def __init__(self, upstream=None) -> None:
+        self._upstream = upstream
+        self._server: asyncio.AbstractServer | None = None
+        self._conns: set[asyncio.Task] = set()
+        self.loop: asyncio.AbstractEventLoop | None = None
+        self.port = 0
+
+    async def start(self) -> None:
+        self.loop = asyncio.get_running_loop()
+        self._server = await asyncio.start_server(self._accept, "127.0.0.1", 0)
+        self.port = self._server.sockets[0].getsockname()[1]
+
+    def browser_args(self, host: str) -> list[str]:
+        return [f"--proxy-server=socks5://{host}:{self.port}",
+                "--proxy-bypass-list=<-loopback>"]
+
+    async def close(self) -> None:
+        if self._server is not None:
+            self._server.close()
+            self._server = None
+        for task in list(self._conns):
+            task.cancel()
+        self._conns.clear()
+
+    async def _accept(self, reader, writer) -> None:
+        task = asyncio.current_task()
+        self._conns.add(task)
+        try:
+            await self._serve(reader, writer)
+        except (asyncio.CancelledError, Exception):
+            pass
+        finally:
+            self._conns.discard(task)
+            writer.close()
+
+    @staticmethod
+    async def _reply(writer, code: int) -> None:
+        writer.write(bytes([5, code, 0, 1, 0, 0, 0, 0, 0, 0]))
+        await writer.drain()
+
+    async def _serve(self, reader, writer) -> None:
+        import socket
+
+        ver, nmethods = await asyncio.wait_for(reader.readexactly(2), 30)
+        if ver != 5:
+            return
+        methods = await reader.readexactly(nmethods)
+        if 0 not in methods:
+            writer.write(b"\x05\xff")
+            await writer.drain()
+            return
+        writer.write(b"\x05\x00")
+        await writer.drain()
+        ver, cmd, _rsv, atyp = await asyncio.wait_for(reader.readexactly(4), 30)
+        if atyp == 1:
+            host = socket.inet_ntop(socket.AF_INET, await reader.readexactly(4))
+        elif atyp == 4:
+            host = socket.inet_ntop(socket.AF_INET6, await reader.readexactly(16))
+        elif atyp == 3:
+            n = (await reader.readexactly(1))[0]
+            host = (await reader.readexactly(n)).decode("ascii", "replace")
+        else:
+            await self._reply(writer, _SOCKS_BAD_ATYP)
+            return
+        port = int.from_bytes(await reader.readexactly(2), "big")
+        if ver != 5 or cmd != 1:
+            await self._reply(writer, _SOCKS_BAD_CMD)
+            return
+        try:
+            addrs = await _resolve_public(host, port)
+        except _EgressRefused:
+            await self._reply(writer, _SOCKS_RULESET)
+            return
+        except Exception:
+            await self._reply(writer, _SOCKS_UNREACHABLE)
+            return
+        try:
+            up_reader, up_writer = await self._open(addrs, port)
+        except Exception:
+            await self._reply(writer, _SOCKS_REFUSED)
+            return
+        try:
+            await self._reply(writer, _SOCKS_OK)
+            await self._relay(reader, writer, up_reader, up_writer)
+        finally:
+            up_writer.close()
+
+    async def _open(self, addrs: list[tuple[int, str]], port: int):
+        last: Exception | None = None
+        for _family, addr in addrs:
+            try:
+                if self._upstream is None:
+                    return await asyncio.wait_for(asyncio.open_connection(addr, port), 15)
+                return await asyncio.wait_for(self._open_upstream(addr, port), 30)
+            except Exception as exc:  # noqa: BLE001 - try the next validated address
+                last = exc
+        raise last or OSError("no address")
+
+    async def _open_upstream(self, addr: str, port: int):
+        import base64
+
+        up = self._upstream
+        r, w = await asyncio.open_connection(up.host, int(up.port))
+        target = f"[{addr}]:{port}" if ":" in addr else f"{addr}:{port}"
+        head = f"CONNECT {target} HTTP/1.1\r\nHost: {target}\r\n"
+        if up.username:
+            token = base64.b64encode(
+                f"{up.username}:{up.password or ''}".encode()).decode()
+            head += f"Proxy-Authorization: Basic {token}\r\n"
+        w.write((head + "\r\n").encode())
+        await w.drain()
+        resp = await r.readuntil(b"\r\n\r\n")
+        status = resp.split(b"\r\n", 1)[0].split()
+        if len(status) < 2 or status[1] != b"200":
+            w.close()
+            raise OSError(f"upstream proxy refused CONNECT: {resp[:80]!r}")
+        return r, w
+
+    @staticmethod
+    async def _relay(r1, w1, r2, w2) -> None:
+        async def pipe(src, dst):
+            while True:
+                data = await src.read(65536)
+                if not data:
+                    break
+                dst.write(data)
+                await dst.drain()
+            if dst.can_write_eof():
+                dst.write_eof()
+
+        tasks = {asyncio.create_task(pipe(r1, w2)), asyncio.create_task(pipe(r2, w1))}
+        try:
+            await asyncio.wait(tasks, return_when=asyncio.FIRST_EXCEPTION)
+        finally:
+            for task in tasks:
+                task.cancel()
+
+
+_guard: _EgressGuard | None = None
+
+
+def _strip_proxy_flags(args: list[str]) -> list[str]:
+    drop = ("--proxy-server", "--proxy-bypass-list", "--proxy-pac-url",
+            "--no-proxy-server", "--proxy-auto-detect", "--host-resolver-rules")
+    return [a for a in args if a.split("=", 1)[0] not in drop]
+
+
+def _guarded_fortress_class():
+    """A Fortress launcher that always starts the engine behind the running
+    _EgressGuard. Refuses to launch without one, so the browser can never come
+    up with unchecked egress."""
+    from tilion_fortress import Fortress
+
+    if getattr(Fortress, "_egress_guarded", False):
+        return Fortress
+
+    class _GuardedFortress(Fortress):
+        _egress_guarded = True
+
+        def start(self):
+            # A fresh port, so the driver can only attach to THIS (guarded) engine —
+            # never to another browser already listening on the default 9222.
+            import socket
+            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+                s.bind(("127.0.0.1", 0))
+                self.port = s.getsockname()[1]
+            return super().start()
+
+        def _guard_args(self, host: str) -> None:
+            if _guard is None or _guard.port == 0:
+                raise RuntimeError("egress guard is not running; refusing to launch the browser")
+            self.extra_args = _strip_proxy_flags(list(self.extra_args)) + _guard.browser_args(host)
+
+        def _start_native(self, plat):
+            self._guard_args("127.0.0.1")
+            return super()._start_native(plat)
+
+        def _start_docker(self):
+            # The containerised engine reaches the host's loopback relay via Docker
+            # Desktop's host alias.
+            self._guard_args("host.docker.internal")
+            return super()._start_docker()
+
+    return _GuardedFortress
+
+
+_PinnedResolver = None
+
+
+def _pinned_resolver():
+    """An aiohttp resolver that only ever returns addresses _resolve_public approved,
+    so each connection is made to the address that was checked."""
+    global _PinnedResolver
+    if _PinnedResolver is None:
+        import socket
+
+        from aiohttp.abc import AbstractResolver
+
+        class _Resolver(AbstractResolver):
+            async def resolve(self, host, port=0, family=socket.AF_INET):
+                return [{"hostname": host, "host": addr, "port": port, "family": fam,
+                         "proto": 0, "flags": socket.AI_NUMERICHOST}
+                        for fam, addr in await _resolve_public(host, port)]
+
+            async def close(self) -> None:
+                return None
+
+        _PinnedResolver = _Resolver
+    return _PinnedResolver()
+
+
+class _GuardedHTTP:
+    """Drop-in for the aiohttp session the facade's downloaders use (`.get()` as an
+    async context manager). Redirects are followed here, one hop at a time. aiohttp
+    hands hostnames to the pinned resolver but connects to IP literals without
+    resolving, so each hop's scheme and literal address are checked before its
+    request. Nothing is returned (or written by the caller) unless every hop was
+    allowed."""
+
+    _REDIRECTS = (301, 302, 303, 307, 308)
+    _MAX_HOPS = 10
+
+    def __init__(self, cookies_for=None) -> None:
+        self._cookies_for = cookies_for
+
+    @staticmethod
+    def _check_hop(url) -> None:
+        import ipaddress
+
+        if url.scheme not in ("http", "https"):
+            raise _EgressRefused(f"refused non-http(s) URL: {str(url)!r}")
+        host = (url.host or "").strip("[]")
+        if not host:
+            raise _EgressRefused(f"invalid url: {str(url)!r}")
+        try:
+            ipaddress.ip_address(host.split("%", 1)[0])
+        except ValueError:
+            return
+        if not _private_egress_allowed() and _ip_blocked(host):
+            raise _EgressRefused(f"refused private/internal address {host!r} "
+                                 "(set TILION_ALLOW_PRIVATE_EGRESS=1 to allow)")
+
+    @asynccontextmanager
+    async def get(self, url, *, headers=None, ssl=None, **_ignored):
+        import aiohttp
+        from yarl import URL
+
+        connector = aiohttp.TCPConnector(resolver=_pinned_resolver(), use_dns_cache=False)
+        timeout = aiohttp.ClientTimeout(total=60, connect=10)
+        ssl_kw = {} if ssl is None else {"ssl": ssl}
+        async with aiohttp.ClientSession(connector=connector, timeout=timeout,
+                                         trust_env=False) as session:
+            current = URL(str(url))
+            for _hop in range(self._MAX_HOPS + 1):
+                self._check_hop(current)
+                hdrs = dict(headers or {})
+                if self._cookies_for is not None:
+                    cookie = await self._cookies_for(str(current))
+                    if cookie:
+                        hdrs["Cookie"] = cookie
+                resp = await session.get(current, headers=hdrs, allow_redirects=False,
+                                         **ssl_kw)
+                location = resp.headers.get("Location")
+                if resp.status in self._REDIRECTS and location:
+                    resp.release()
+                    current = current.join(URL(location))
+                    continue
+                try:
+                    yield resp
+                finally:
+                    resp.release()
+                return
+            raise aiohttp.TooManyRedirects(None, (), message=f"too many redirects: {url}")
+
+
+_nav_blocked: contextvars.ContextVar[set | None] = contextvars.ContextVar(
+    "fortress_mcp_nav_blocked", default=None)
+
+
+def _install_facade_guards() -> None:
+    """Route the facade's in-process downloaders (Tab.download_url — used by
+    download_file and the run_browser_task download flow — and the document
+    fetcher behind extract_document) through _GuardedHTTP, and let crawl_site see
+    which navigations the egress guard did not connect."""
+    from tilion.core.tab import Tab
+    from tilion.core.scraping import extractor as _extractor
+
+    if not getattr(Tab.download_url, "_egress_guarded", False):
+        async def download_url(self, url, output_path=None, headers=None,
+                               use_browser_session=True):
+            async def browser_cookies(hop: str) -> str:
+                session = await self._ensure_session()
+                got = await session.send("Network.getCookies", {"urls": [hop]})
+                return "; ".join(f"{c['name']}={c['value']}"
+                                 for c in (got or {}).get("cookies", []))
+
+            http = _GuardedHTTP(browser_cookies if use_browser_session else None)
+            return await self._do_download(http, url, output_path, dict(headers or {}))
+
+        download_url._egress_guarded = True
+        Tab.download_url = download_url
+
+    if not getattr(Tab.goto, "_egress_guarded", False):
+        _goto = Tab.goto
+
+        @functools.wraps(_goto)
+        async def goto(self, url, *args, **kwargs):
+            try:
+                return await _goto(self, url, *args, **kwargs)
+            except Exception as exc:
+                sink = _nav_blocked.get()
+                if sink is not None and "ERR_SOCKS_" in str(exc):
+                    sink.add(url)
+                raise
+
+        goto._egress_guarded = True
+        Tab.goto = goto
+
+    Extractor = _extractor.Extractor
+    if not getattr(Extractor._download_url, "_egress_guarded", False):
+        async def _download_url(self, url):
+            async with _GuardedHTTP().get(url, ssl=True) as resp:
+                if resp.status != 200:
+                    raise _extractor.ExtractionError(f"HTTP {resp.status} fetching {url}")
+                return await resp.read()
+
+        _download_url._egress_guarded = True
+        Extractor._download_url = _download_url
+
+
+async def _ensure_egress_guard(upstream) -> None:
+    """Start (or restart, if its loop is gone) the guard and make every Fortress
+    launch in this process go through it."""
+    global _guard
+    import tilion_fortress
+
+    loop = asyncio.get_running_loop()
+    if _guard is not None and (_guard.loop is not loop or _guard._server is None):
+        _guard = None
+    if _guard is None:
+        g = _EgressGuard(upstream)
+        await g.start()
+        _guard = g
+    _guard._upstream = upstream
+    tilion_fortress.Fortress = _guarded_fortress_class()
+    _install_facade_guards()
 
 
 def _write_root() -> str:
@@ -163,13 +579,16 @@ async def _lifespan(_server):
     try:
         yield
     finally:
-        global _tilion
+        global _tilion, _guard
         if _tilion is not None:
             try:
                 await _tilion.close()
             except Exception:
                 pass
             _tilion = None
+        if _guard is not None:
+            await _guard.close()
+            _guard = None
 
 
 mcp = FastMCP("Fortress Stealth Browser", lifespan=_lifespan)
@@ -190,7 +609,8 @@ async def _t() -> Tilion:
     if _lock is None:            # bind lazily to the running loop (atomic: no await)
         _lock = asyncio.Lock()
     async with _lock:
-        if _tilion is not None and not _tilion.is_healthy():
+        stale_guard = _guard is None or _guard.loop is not asyncio.get_running_loop()
+        if _tilion is not None and (stale_guard or not _tilion.is_healthy()):
             try:
                 await _tilion.close()
             except Exception:
@@ -211,6 +631,7 @@ async def _t() -> Tilion:
                 captcha_api_key=os.environ.get("CAPTCHA_API_KEY"),
                 captcha_provider=os.environ.get("CAPTCHA_PROVIDER", "2captcha"),
             )
+            await _ensure_egress_guard(getattr(inst, "_proxy", None))
             await inst.start()
             _tilion = inst
     return _tilion
@@ -314,6 +735,29 @@ async def extract_page(url: str, schema: dict | None = None) -> dict:
     return _cap(r, {"markdown": 40000, "text": 20000})
 
 
+def _drop_blocked_pages(r: dict, blocked: set[str]) -> dict:
+    """The indexer lists a page before navigating to it; remove pages the egress
+    guard never connected so they are not reported as crawled."""
+    sitemap = r.get("sitemap")
+    dropped = 0
+    if isinstance(sitemap, str):
+        kept = []
+        for line in sitemap.split("\n"):
+            s = line.strip()
+            if s.startswith("<url><loc>") and s.endswith("</loc></url>") \
+                    and s[len("<url><loc>"):-len("</loc></url>")] in blocked:
+                dropped += 1
+                continue
+            kept.append(line)
+        r["sitemap"] = "\n".join(kept)
+    if dropped:
+        for holder in (r, r.get("stats") if isinstance(r.get("stats"), dict) else {}):
+            if isinstance(holder.get("pages_crawled"), int):
+                holder["pages_crawled"] = max(0, holder["pages_crawled"] - dropped)
+        r["pages_blocked"] = dropped
+    return r
+
+
 @mcp.tool(annotations=_READ)
 @_safe
 async def crawl_site(url: str, depth: int = 2, max_pages: int = 100,
@@ -328,7 +772,14 @@ async def crawl_site(url: str, depth: int = 2, max_pages: int = 100,
     if ctx:
         await _log(ctx, f"crawling {url} (depth {depth}, up to {max_pages} pages)…")
     t = await _t()
-    r = await t.crawl(url, depth=depth, max_pages=max_pages)
+    blocked: set[str] = set()
+    token = _nav_blocked.set(blocked)
+    try:
+        r = await t.crawl(url, depth=depth, max_pages=max_pages)
+    finally:
+        _nav_blocked.reset(token)
+    if blocked:
+        r = _drop_blocked_pages(r, blocked)
     if ctx:
         await _log(ctx, f"crawled {r.get('pages_crawled', 0)} pages, {r.get('document_count', 0)} documents")
     docs = r.get("documents")                     # cap the doc list so a big crawl can't flood context
