@@ -628,10 +628,32 @@ async def load_profile(name: str = "session") -> dict:
     """Restore a saved session (cookies + localStorage) from a named profile — reuse a
     login without re-authenticating. Navigate to the site afterward."""
     p = _confine_path(name, ".json")
-    if not os.path.exists(p):
-        return {"status": "error", "error": f"no profile {name!r} — call save_profile first"}
-    t = await _t()
-    r = await t.load_profile(p)
+    if _env("MCP_ALLOW_ANY_PATH", "0") == "1":
+        if not os.path.exists(p):
+            return {"status": "error", "error": f"no profile {name!r} — call save_profile first"}
+        t = await _t()
+        r = await t.load_profile(p)
+        r["profile"] = name
+        return r
+    fname = os.path.basename(p)
+    try:
+        data = _read_confined(fname)
+    except ValueError as exc:
+        if not os.path.lexists(os.path.join(_write_root(), fname)):
+            return {"status": "error", "error": f"no profile {name!r} — call save_profile first"}
+        return {"status": "error", "error": str(exc)}
+    import tempfile
+    fd, tmp = tempfile.mkstemp(suffix=".json", prefix="tilion_profile_", dir=_write_root())
+    try:
+        with os.fdopen(fd, "wb") as fh:
+            fh.write(data)
+        t = await _t()
+        r = await t.load_profile(tmp)
+    finally:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
     r["profile"] = name
     return r
 
