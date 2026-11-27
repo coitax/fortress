@@ -68,7 +68,7 @@ Don't guess why you're blocked — **read `waf`** and act on the vendor.
 | Tool | When | Returns |
 |---|---|---|
 | **`extract_page(url, schema?)`** | page → markdown + tables + metadata, or a **schema-shaped record** (pass `{"name":null,"price":null}` and it fills from JSON-LD/OpenGraph) | `{markdown, tables, metadata, structured}` |
-| **`extract_document(source)`** | a PDF/DOCX/XLSX/CSV/HTML **file** (path or URL) | `{markdown, tables, …}` |
+| **`extract_document(source)`** | a PDF/DOCX/XLSX/CSV/HTML **file** (URL, or a file name in the sandbox dir `TILION_MCP_WRITE_DIR`) | `{markdown, tables, …}` |
 
 ### Whole sites / hidden APIs
 | Tool | When | Returns |

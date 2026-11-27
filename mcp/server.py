@@ -133,6 +133,60 @@ def _confine_path(path: str | None, suffix: str) -> str:
     return os.path.join(root, name)
 
 
+def _read_confined(name: str) -> bytes:
+    """Read a tool-supplied file from the sandbox root (the same directory writes
+    are confined to) — blocks reading arbitrary files such as ~/.ssh/id_* or cloud
+    credentials. Only a bare file name directly under the root is accepted:
+    absolute paths, directory segments and '..' are refused, and a symlink is never
+    followed. The file is opened once and every check runs against that open
+    handle, so swapping the name after validation cannot redirect the read.
+    There is deliberately no ALLOW_ANY_PATH escape hatch for reads."""
+    import errno
+    import stat
+
+    root = _write_root()
+    if (not name or name in (".", "..") or "\x00" in name
+            or "/" in name or "\\" in name or (os.name == "nt" and ":" in name)):
+        raise ValueError(f"refused document path {name!r}: pass a bare file name "
+                         f"located in {root} (no directories, absolute paths or '..')")
+    flags = (os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0)
+             | getattr(os, "O_BINARY", 0))
+    path = os.path.join(root, name)
+    try:
+        if os.open in os.supports_dir_fd and hasattr(os, "O_NOFOLLOW"):
+            dfd = os.open(root, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+            try:
+                fd = os.open(name, flags, dir_fd=dfd)
+            finally:
+                os.close(dfd)
+        else:
+            fd = os.open(path, flags)
+    except FileNotFoundError:
+        raise ValueError(f"no document {name!r} in {root}") from None
+    except OSError as exc:
+        if exc.errno in (errno.ELOOP, errno.EMLINK):
+            raise ValueError(f"refused document {name!r}: symlinks are not followed") from None
+        raise ValueError(f"cannot open document {name!r}: {exc.strerror}") from None
+    try:
+        st = os.fstat(fd)
+        if not stat.S_ISREG(st.st_mode):
+            raise ValueError(f"refused document {name!r}: not a regular file")
+        if not hasattr(os, "O_NOFOLLOW") or os.open not in os.supports_dir_fd:
+            # No O_NOFOLLOW/dir_fd (Windows): the open may have followed a link, so
+            # require the name to still be that same non-link file.
+            lst = os.lstat(path)
+            if (stat.S_ISLNK(lst.st_mode)
+                    or getattr(lst, "st_file_attributes", 0) & 0x400  # reparse point
+                    or (lst.st_dev, lst.st_ino) != (st.st_dev, st.st_ino)):
+                raise ValueError(f"refused document {name!r}: symlinks are not followed")
+        with os.fdopen(fd, "rb") as fh:
+            fd = -1
+            return fh.read()
+    finally:
+        if fd >= 0:
+            os.close(fd)
+
+
 async def _log(ctx, msg: str) -> None:
     """Best-effort server→client log. Never breaks a tool if the client has no
     logging capability (or there's no active session, e.g. in tests)."""
@@ -477,14 +531,22 @@ async def current_page() -> dict:
 @_safe
 async def extract_document(source: str) -> dict:
     """Extract clean text/markdown + tables from a DOCUMENT — a PDF, DOCX, XLSX, CSV,
-    or HTML file, given a local path OR a URL (even one behind bot detection). Use for
-    reports, datasheets, filings, or any file the agent must read.
+    or HTML file, given a URL (even one behind bot detection) OR the bare file name of
+    a document in the server's sandbox directory (where download_file / save_page
+    write). Use for reports, datasheets, filings, or any file the agent must read.
     """
     t = await _t()
-    is_url = source[:4].lower() == "http"
-    if is_url:
+    if source.lower().startswith(("http://", "https://")):
         await _check_url(source)
-    r = await (t.extract_url(source) if is_url else t.extract_file(source))
+        r = await t.extract_url(source)
+    else:
+        import mimetypes
+        from tilion.core.scraping.extractor import Extractor
+        t._require_local("extract_file")
+        data = _read_confined(source)
+        res = await Extractor().extract_file(data, mime_type=mimetypes.guess_type(source)[0])
+        r = Tilion._extraction_dict(res)
+        r["source_url"] = source
     r.pop("html", None)
     return _cap(r, {"markdown": 40000, "text": 20000})
 
@@ -566,10 +628,32 @@ async def load_profile(name: str = "session") -> dict:
     """Restore a saved session (cookies + localStorage) from a named profile — reuse a
     login without re-authenticating. Navigate to the site afterward."""
     p = _confine_path(name, ".json")
-    if not os.path.exists(p):
-        return {"status": "error", "error": f"no profile {name!r} — call save_profile first"}
-    t = await _t()
-    r = await t.load_profile(p)
+    if _env("MCP_ALLOW_ANY_PATH", "0") == "1":
+        if not os.path.exists(p):
+            return {"status": "error", "error": f"no profile {name!r} — call save_profile first"}
+        t = await _t()
+        r = await t.load_profile(p)
+        r["profile"] = name
+        return r
+    fname = os.path.basename(p)
+    try:
+        data = _read_confined(fname)
+    except ValueError as exc:
+        if not os.path.lexists(os.path.join(_write_root(), fname)):
+            return {"status": "error", "error": f"no profile {name!r} — call save_profile first"}
+        return {"status": "error", "error": str(exc)}
+    import tempfile
+    fd, tmp = tempfile.mkstemp(suffix=".json", prefix="tilion_profile_", dir=_write_root())
+    try:
+        with os.fdopen(fd, "wb") as fh:
+            fh.write(data)
+        t = await _t()
+        r = await t.load_profile(tmp)
+    finally:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
     r["profile"] = name
     return r
 
