@@ -3,7 +3,8 @@ tilion-fortress — install and drive the Fortress stealth Chromium engine.
 
 Ships the prebuilt binary only (no engine source). Detects the platform, downloads the
 matching bundle from the official GitHub Release, verifies it against SHA256SUMS, caches
-it, and launches it with a CDP endpoint. **Linux x64 and Windows x64 have native binaries**
+it, and launches it with a CDP endpoint. Every launch re-verifies the cached archive and runs
+a private copy extracted from the verified bytes, never the files in the cache. **Linux x64 and Windows x64 have native binaries**
 (downloaded automatically — no Docker needed). macOS has no native bundle yet and uses the
 Docker image; Docker is also the fallback anywhere a native launch isn't available.
 
@@ -12,7 +13,7 @@ Docker image; Docker is also the fallback anywhere a native launch isn't availab
         print(f.cdp_url)   # connect any CDP client (Playwright/Puppeteer)
 """
 from __future__ import annotations
-import hashlib, json, os, platform, shutil, subprocess, sys, tarfile, time, urllib.request, zipfile
+import hashlib, json, os, platform, shutil, subprocess, sys, tarfile, tempfile, time, urllib.request, zipfile
 from pathlib import Path
 
 __version__ = "151.0.7908.0.post4"
@@ -76,41 +77,117 @@ def _expected_sha(asset: str, host: str) -> str | None:
     return None
 
 
-def _download(plat: str, host: str, tag: str) -> Path:
-    """Ensure the bundle for `plat` is present + verified; return the launcher path."""
-    asset, kind, launcher_rel = _ASSETS[plat]
-    root = _CACHE / tag / plat   # cache per release tag so channels don't collide
-    launcher = root / launcher_rel
-    if launcher.exists():
-        return launcher
-    root.mkdir(parents=True, exist_ok=True)
-    archive = root / asset
+def _copy_hashed(src: Path, dst: Path) -> str:
+    """Copy `src` to the new file `dst`; return the SHA-256 of the bytes written."""
+    h = hashlib.sha256()
+    with open(src, "rb") as fin, open(dst, "xb") as fout:
+        for chunk in iter(lambda: fin.read(1 << 20), b""):
+            h.update(chunk)
+            fout.write(chunk)
+    return h.hexdigest()
+
+
+def _fetch_archive(plat: str, host: str, tag: str, dest: Path) -> bool:
+    """Write the release archive for `plat` to `dest`, verified against SHA256SUMS.
+
+    The cached archive is reused when its bytes match, otherwise the asset is downloaded.
+    Returns True when it was downloaded. The cache may be shared or writable by others, so
+    `dest` must be in a directory only we can write, and only that copy is trusted afterwards.
+    """
+    asset = _ASSETS[plat][0]
+    expected = _expected_sha(asset, host)
+    if not expected:
+        raise RuntimeError(f"no SHA256SUMS entry for {asset} at {host}; "
+                           "refusing to use an unverified bundle")
+    try:
+        if _copy_hashed(_CACHE / tag / plat / asset, dest) == expected:
+            return False
+    except OSError:
+        pass
+    dest.unlink(missing_ok=True)
     url = f"{host}/{asset}"
     sys.stderr.write(f"[tilion-fortress] downloading {url} ...\n")
-    urllib.request.urlretrieve(url, archive)
+    urllib.request.urlretrieve(url, dest)
+    actual = _sha256(dest)
+    if actual != expected:
+        dest.unlink(missing_ok=True)
+        raise RuntimeError(f"SHA256 mismatch for {asset}: expected {expected}, got {actual}")
+    sys.stderr.write("[tilion-fortress] SHA256 verified\n")
+    return True
 
-    expected = _expected_sha(asset, host)
-    if expected:
-        actual = _sha256(archive)
-        if actual != expected:
-            archive.unlink(missing_ok=True)
-            raise RuntimeError(f"SHA256 mismatch for {asset}: expected {expected}, got {actual}")
-        sys.stderr.write("[tilion-fortress] SHA256 verified\n")
-    else:
-        sys.stderr.write("[tilion-fortress] WARNING: no SHA256SUMS published; skipping verification\n")
 
+def _extract(archive: Path, kind: str, dest: Path) -> None:
     if kind == "tar":
         with tarfile.open(archive) as t:
-            t.extractall(root)
+            t.extractall(dest)
     else:
         with zipfile.ZipFile(archive) as z:
-            z.extractall(root)
-    archive.unlink(missing_ok=True)
-    if launcher.exists() and not launcher.name.endswith(".cmd"):
-        launcher.chmod(0o755)
-    if not launcher.exists():
-        raise RuntimeError(f"bundle extracted but launcher missing: {launcher}")
-    return launcher
+            z.extractall(dest)
+
+
+def _install_cache(archive: Path, kind: str, root: Path) -> None:
+    """Replace the cached archive and bundle tree under `root` with the verified `archive`."""
+    root.mkdir(parents=True, exist_ok=True)
+    stage = Path(tempfile.mkdtemp(prefix=".extract-", dir=root))
+    try:
+        _extract(archive, kind, stage)
+        for entry in list(stage.iterdir()):
+            dest = root / entry.name
+            if dest.is_dir() and not dest.is_symlink():
+                shutil.rmtree(dest)
+            elif os.path.lexists(dest):
+                dest.unlink()
+            os.replace(entry, dest)
+        shutil.copyfile(archive, stage / archive.name)
+        os.replace(stage / archive.name, root / archive.name)
+    finally:
+        shutil.rmtree(stage, ignore_errors=True)
+
+
+def _download(plat: str, host: str, tag: str) -> Path:
+    """Install the verified bundle for `plat` into the cache; return the cached launcher path.
+
+    Never execute the returned path: the cache can be rewritten after this returns.
+    Launches go through `_private_bundle`.
+    """
+    asset, kind, launcher_rel = _ASSETS[plat]
+    root = _CACHE / tag / plat   # cache per release tag so channels don't collide
+    with tempfile.TemporaryDirectory(prefix="tilion-fortress-") as tmp:
+        archive = Path(tmp) / asset
+        _fetch_archive(plat, host, tag, archive)
+        _install_cache(archive, kind, root)
+    return root / launcher_rel
+
+
+def _private_bundle(plat: str, host: str, tag: str) -> tuple[Path, Path]:
+    """Extract the verified bundle into a new private directory; return (directory, launcher).
+
+    Refuses to start when the cached launcher is not the one in the verified release.
+    """
+    asset, kind, launcher_rel = _ASSETS[plat]
+    root = _CACHE / tag / plat
+    private = Path(tempfile.mkdtemp(prefix="tilion-fortress-"))
+    try:
+        archive = private / asset
+        if _fetch_archive(plat, host, tag, archive):
+            _install_cache(archive, kind, root)
+        bundle = private / "bundle"
+        _extract(archive, kind, bundle)
+        archive.unlink()
+        launcher = bundle / launcher_rel
+        if not launcher.is_file():
+            raise RuntimeError(f"bundle extracted but launcher missing: {launcher}")
+        if not launcher.name.endswith(".cmd"):
+            launcher.chmod(0o755)
+        cached = root / launcher_rel
+        if os.path.lexists(cached) and (
+                cached.is_symlink() or not cached.is_file() or _sha256(cached) != _sha256(launcher)):
+            raise RuntimeError(f"cached launcher {cached} does not match the verified release; "
+                               f"refusing to start. Delete {root} to reinstall.")
+        return private, launcher
+    except BaseException:
+        shutil.rmtree(private, ignore_errors=True)
+        raise
 
 
 def _persona_args(persona: dict | None) -> list[str]:
@@ -140,7 +217,7 @@ class Fortress:
         self._tag = _CHANNELS[ch]["tag"]
         self._docker = _CHANNELS[ch]["docker"]
         self._host = _host(self._tag)
-        self._proc = self._docker_name = self.cdp_url = None
+        self._proc = self._docker_name = self._bundle_dir = self.cdp_url = None
 
     def start(self) -> "Fortress":
         plat = resolve_platform()
@@ -163,7 +240,7 @@ class Fortress:
             return False
 
     def _start_native(self, plat: str):
-        launcher = _download(plat, self._host, self._tag)
+        bundle_dir, launcher = _private_bundle(plat, self._host, self._tag)
         flags = []
         if self.headless:
             flags += ["--headless=new", "--no-sandbox"]
@@ -175,7 +252,12 @@ class Fortress:
             args = ["cmd", "/c", str(launcher)] + flags
         else:
             args = [str(launcher)] + flags
-        self._proc = subprocess.Popen(args, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        try:
+            self._proc = subprocess.Popen(args, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        except BaseException:
+            shutil.rmtree(bundle_dir, ignore_errors=True)
+            raise
+        self._bundle_dir = bundle_dir
 
     def _start_docker(self):
         if not shutil.which("docker"):
@@ -207,7 +289,14 @@ class Fortress:
                                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
             else:
                 self._proc.terminate()
+            try:
+                self._proc.wait(timeout=10)
+            except subprocess.TimeoutExpired:
+                pass
             self._proc = None
+        if self._bundle_dir:
+            shutil.rmtree(self._bundle_dir, ignore_errors=True)
+            self._bundle_dir = None
         if self._docker_name:
             subprocess.run(["docker", "rm", "-f", self._docker_name],
                            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
