@@ -1,11 +1,17 @@
 // tilion-fortress (Node) — install & drive the Fortress stealth Chromium engine.
 // Ships the prebuilt binary only (no engine source). Detects platform, downloads the
 // matching bundle from the GitHub Release, verifies SHA256, caches it, launches with CDP.
+// Every launch re-verifies the cached archive and runs a private copy extracted from the
+// verified bytes, never the files in the cache.
 // macOS/Windows fall back to the Docker image until native binaries are published.
 import { spawn, spawnSync } from "node:child_process";
-import { createWriteStream, existsSync, chmodSync, mkdirSync, createReadStream } from "node:fs";
-import { homedir } from "node:os";
-import { join } from "node:path";
+import {
+  createWriteStream, existsSync, chmodSync, mkdirSync, createReadStream, copyFileSync, lstatSync,
+  mkdtempSync, readdirSync, renameSync, rmSync, constants as fsConstants,
+} from "node:fs";
+import { homedir, tmpdir } from "node:os";
+import { basename, join } from "node:path";
+import { Transform } from "node:stream";
 import { pipeline } from "node:stream/promises";
 import { createHash } from "node:crypto";
 
@@ -65,38 +71,97 @@ export async function expectedSha(asset, host) {
   return null;
 }
 
-async function ensureNative(plat, host, tag) {
-  const { asset, kind, launcher } = ASSETS[plat];
-  const root = join(CACHE, tag, plat);   // cache per release tag so channels don't collide
-  const launcherPath = join(root, launcher);
-  if (existsSync(launcherPath)) return launcherPath;
-  mkdirSync(root, { recursive: true });
-  const archive = join(root, asset);
+async function copyHashed(src, dst) {
+  const h = createHash("sha256");
+  const tap = new Transform({ transform(chunk, _enc, cb) { h.update(chunk); cb(null, chunk); } });
+  await pipeline(createReadStream(src), tap, createWriteStream(dst, { flags: "wx" }));
+  return h.digest("hex");
+}
+
+// Writes the release archive for `plat` to `dest`, verified against SHA256SUMS; returns true when
+// it was downloaded rather than taken from the cache. The cache may be shared or writable by
+// others, so `dest` must be in a directory only we can write, and only that copy is trusted.
+async function fetchArchive(plat, host, tag, dest) {
+  const { asset } = ASSETS[plat];
+  const exp = await expectedSha(asset, host);
+  if (!exp) throw new Error(`no SHA256SUMS entry for ${asset} at ${host}; refusing to use an unverified bundle`);
+  try {
+    if (await copyHashed(join(CACHE, tag, plat, asset), dest) === exp) return false;
+  } catch { /* not cached */ }
+  rmSync(dest, { force: true });
   process.stderr.write(`[tilion-fortress] downloading ${host}/${asset} ...\n`);
   const res = await fetch(`${host}/${asset}`);
   if (!res.ok) throw new Error(`download failed: ${res.status}`);
-  await pipeline(res.body, createWriteStream(archive));
-
-  const exp = await expectedSha(asset, host);
-  if (exp) {
-    const act = await sha256(archive);
-    if (act !== exp) throw new Error(`SHA256 mismatch for ${asset}: expected ${exp}, got ${act}`);
-    process.stderr.write("[tilion-fortress] SHA256 verified\n");
-  } else {
-    process.stderr.write("[tilion-fortress] WARNING: no SHA256SUMS published; skipping verification\n");
+  await pipeline(res.body, createWriteStream(dest, { flags: "wx" }));
+  const act = await sha256(dest);
+  if (act !== exp) {
+    rmSync(dest, { force: true });
+    throw new Error(`SHA256 mismatch for ${asset}: expected ${exp}, got ${act}`);
   }
+  process.stderr.write("[tilion-fortress] SHA256 verified\n");
+  return true;
+}
 
+function extract(archive, kind, dest) {
+  mkdirSync(dest, { recursive: true });
+  let r;
   if (kind === "tar") {
-    if (spawnSync("tar", ["xzf", archive, "-C", root], { stdio: "inherit" }).status !== 0)
-      throw new Error("tar extraction failed");
-  } else { // zip (Windows): use PowerShell Expand-Archive
-    if (spawnSync("powershell", ["-NoProfile", "-Command",
-        `Expand-Archive -Force -LiteralPath '${archive}' -DestinationPath '${root}'`],
-        { stdio: "inherit" }).status !== 0) throw new Error("zip extraction failed");
+    r = spawnSync("tar", ["xzf", archive, "-C", dest], { stdio: "inherit" });
+  } else if (process.platform === "win32") {
+    r = spawnSync("powershell", ["-NoProfile", "-Command",
+      "Expand-Archive -Force -LiteralPath $env:TF_ARCHIVE -DestinationPath $env:TF_DEST"],
+      { stdio: "inherit", env: { ...process.env, TF_ARCHIVE: archive, TF_DEST: dest } });
+  } else {
+    r = spawnSync("unzip", ["-q", "-o", archive, "-d", dest], { stdio: "inherit" });
   }
-  if (!launcher.endsWith(".cmd") && existsSync(launcherPath)) chmodSync(launcherPath, 0o755);
-  if (!existsSync(launcherPath)) throw new Error(`launcher missing after extract: ${launcherPath}`);
-  return launcherPath;
+  if (r.status !== 0) throw new Error(`${kind} extraction failed`);
+}
+
+// Replaces the cached archive and bundle tree under `root` with the verified `archive`.
+function installCache(archive, kind, root) {
+  mkdirSync(root, { recursive: true });
+  const stage = mkdtempSync(join(root, ".extract-"));
+  try {
+    extract(archive, kind, stage);
+    for (const name of readdirSync(stage)) {
+      const dest = join(root, name);
+      rmSync(dest, { recursive: true, force: true });
+      renameSync(join(stage, name), dest);
+    }
+    const copy = join(stage, basename(archive));
+    copyFileSync(archive, copy, fsConstants.COPYFILE_EXCL);
+    renameSync(copy, join(root, basename(archive)));
+  } finally {
+    rmSync(stage, { recursive: true, force: true });
+  }
+}
+
+// Extracts the verified bundle into a new private directory and returns { dir, launcherPath }.
+// Nothing in the cache is executed. Refuses to start when the cached launcher is not the one in
+// the verified release.
+async function privateBundle(plat, host, tag) {
+  const { asset, kind, launcher } = ASSETS[plat];
+  const root = join(CACHE, tag, plat);   // cache per release tag so channels don't collide
+  const dir = mkdtempSync(join(tmpdir(), "tilion-fortress-"));
+  try {
+    const archive = join(dir, asset);
+    if (await fetchArchive(plat, host, tag, archive)) installCache(archive, kind, root);
+    const bundle = join(dir, "bundle");
+    extract(archive, kind, bundle);
+    rmSync(archive);
+    const launcherPath = join(bundle, launcher);
+    if (!existsSync(launcherPath)) throw new Error(`launcher missing after extract: ${launcherPath}`);
+    if (!launcher.endsWith(".cmd")) chmodSync(launcherPath, 0o755);
+    const cached = join(root, launcher);
+    let st = null;
+    try { st = lstatSync(cached); } catch { /* no cached tree */ }
+    if (st && (!st.isFile() || await sha256(cached) !== await sha256(launcherPath)))
+      throw new Error(`cached launcher ${cached} does not match the verified release; refusing to start. Delete ${root} to reinstall.`);
+    return { dir, launcherPath };
+  } catch (e) {
+    rmSync(dir, { recursive: true, force: true });
+    throw e;
+  }
 }
 
 async function assetExists(plat, host) {
@@ -119,7 +184,7 @@ export class Fortress {
     if (!CHANNELS[channel]) throw new Error(`unknown channel '${channel}'; use one of ${Object.keys(CHANNELS)}`);
     const { tag, docker } = CHANNELS[channel];
     Object.assign(this, { port, persona, extraArgs, headless, channel, tag, docker, host: hostFor(tag),
-                          proc: null, dockerName: null, cdpUrl: null });
+                          proc: null, dockerName: null, bundleDir: null, cdpUrl: null });
   }
   static async launch(opts) { return new Fortress(opts).start(); }
 
@@ -132,12 +197,18 @@ export class Fortress {
   }
 
   async _startNative(plat) {
-    const launcher = await ensureNative(plat, this.host, this.tag);
+    const { dir, launcherPath } = await privateBundle(plat, this.host, this.tag);
     const args = [];
     if (this.headless) args.push("--headless=new", "--no-sandbox");
     args.push(`--remote-debugging-port=${this.port}`, `--user-data-dir=${join(CACHE, "profile")}`,
               ...personaArgs(this.persona), ...this.extraArgs);
-    this.proc = spawn(launcher, args, { stdio: "ignore", shell: launcher.endsWith(".cmd") });
+    try {
+      this.proc = spawn(launcherPath, args, { stdio: "ignore", shell: launcherPath.endsWith(".cmd") });
+    } catch (e) {
+      rmSync(dir, { recursive: true, force: true });
+      throw e;
+    }
+    this.bundleDir = dir;
   }
 
   _startDocker() {
@@ -157,6 +228,10 @@ export class Fortress {
         spawnSync("taskkill", ["/F", "/T", "/PID", String(this.proc.pid)], { stdio: "ignore" });
       else this.proc.kill();
       this.proc = null;
+    }
+    if (this.bundleDir) {
+      try { rmSync(this.bundleDir, { recursive: true, force: true, maxRetries: 5 }); } catch { /* still in use */ }
+      this.bundleDir = null;
     }
     if (this.dockerName) { spawnSync("docker", ["rm", "-f", this.dockerName], { stdio: "ignore" }); this.dockerName = null; }
   }
